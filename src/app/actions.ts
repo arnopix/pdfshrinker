@@ -1,5 +1,6 @@
 "use server";
 
+import { headers } from "next/headers";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import {
@@ -9,8 +10,39 @@ import {
   type FileMeta,
 } from "@/lib/storage";
 import { compressPdf } from "@/lib/compress";
+import { DAY, HOUR, ipHash, takeAll } from "@/lib/rate-limit";
 
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 Mo (Vercel function limit)
+const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 Mo (même borne que bodySizeLimit)
+
+// Dépôt anonyme vers un stockage public + compression gourmande en CPU :
+// débit limité par IP, plafond global par jour.
+const PER_IP_HOUR = 5;
+const PER_IP_DAY = 15;
+const GLOBAL_PER_DAY = 100;
+
+async function allowed(): Promise<boolean> {
+  try {
+    const ip = ipHash((await headers()).get("x-forwarded-for"));
+    return takeAll([
+      { key: `up:h:${ip}`, max: PER_IP_HOUR, windowMs: HOUR },
+      { key: `up:d:${ip}`, max: PER_IP_DAY, windowMs: DAY },
+      { key: "up:global", max: GLOBAL_PER_DAY, windowMs: DAY },
+    ]);
+  } catch {
+    return false; // limiteur en panne : on refuse
+  }
+}
+
+/** Un vrai PDF commence par « %PDF- » (toléré dans le premier kilo-octet). */
+function looksLikePdf(data: Uint8Array): boolean {
+  return Buffer.from(data.subarray(0, 1024)).includes("%PDF-");
+}
+
+/** Nom d'origine conservé pour le téléchargement : sans caractères de contrôle ni guillemets. */
+function safeName(name: string): string {
+  const base = name.replace(/[\u0000-\u001f\u007f"\\/]/g, "").trim().slice(0, 150);
+  return base.toLowerCase().endsWith(".pdf") ? base : "document.pdf";
+}
 
 const uploadSchema = z.object({
   targetSizeMb: z
@@ -44,7 +76,14 @@ export async function uploadAndCompress(
   }
 
   if (file.size > MAX_FILE_SIZE) {
-    return { success: false, error: "Fichier trop volumineux (max 50 Mo)." };
+    return { success: false, error: "Fichier trop volumineux (max 20 Mo)." };
+  }
+
+  if (!(await allowed())) {
+    return {
+      success: false,
+      error: "Trop de fichiers envoyés depuis cette adresse. Réessayez plus tard.",
+    };
   }
 
   const parsed = uploadSchema.safeParse({
@@ -57,13 +96,19 @@ export async function uploadAndCompress(
   const arrayBuffer = await file.arrayBuffer();
   const inputData = new Uint8Array(arrayBuffer);
 
+  // Rien ne part vers le stockage public tant que ce n'est pas un PDF.
+  if (!looksLikePdf(inputData)) {
+    return { success: false, error: "Ce fichier n'est pas un PDF valide." };
+  }
+  const originalName = safeName(file.name);
+
   // Save original to Vercel Blob
-  const originalUrl = await saveOriginal(id, inputData, file.name);
+  const originalUrl = await saveOriginal(id, inputData, originalName);
 
   // Create initial metadata
   const meta: FileMeta = {
     id,
-    originalName: file.name,
+    originalName,
     originalSize: file.size,
     compressedSize: null,
     targetSizeMb,
